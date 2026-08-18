@@ -1,0 +1,7 @@
+# Windows(core.autocrlf=true)のクローンでシェルスクリプトがCRLF化して
+# WSL実行時に "env: $'bash\r': No such file or directory" で死ぬのを防ぐ。
+# シェル/Pythonスクリプトと設定ファイルは常にLFでチェックアウトする。
+*.sh    text eol=lf
+*.py    text eol=lf
+*.env   text eol=lf
+*.patch text eol=lf
