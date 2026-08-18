@@ -104,18 +104,44 @@ OPTS_GCC=(
   --with-gnu-as
   --with-gnu-ld
   --without-zstd
-  # GCC 13+(PR108865)はmingwホストでドライバ/コンパイラ本体にUTF-8コードページの
-  # マニフェストを埋め込むが、binutils(ld)はANSI動作のためコードページ不整合が生じ、
-  # マルチバイト文字を含むprefixでリンクが壊れる(実測: 15.2.0 + binutils 2.45)。
-  # 無効化して全ツールをANSI(CP932)動作に統一する(azduino 7.3と同一原則)。
-  # 非mingwホストではこのオプションは無視される。
-  --disable-win32-utf8-manifest
+  # UTF-8マニフェスト(GCC 13+/PR108865の既定)は有効のまま使う。
+  # wazamono1では --disable-win32-utf8-manifest で全ツールをANSI(CP932)に
+  # 統一していたが、その理由は「binutils 2.45のbfdio.c多バイトパスバグ +
+  # コードページ混在でリンクが壊れる」ことへの回避策だった。現在ピンして
+  # いる binutils 2.46.1 で当該バグは上流修正済みのため前提が消滅している。
+  # ANSI動作には実害もある: 日本語名フォルダ配下で診断メッセージのパスが
+  # CP932バイトで出力され、Arduino IDE⇔arduino-cliのgRPC(UTF-8必須)が
+  # "invalid UTF-8" で失敗する。UTF-8マニフェストにより argv/診断とも
+  # UTF-8 になりこの問題が根治する。binutils側には同等のconfigure
+  # オプションが無いため、下のbinutilsステップでリソースを自前注入して
+  # 全ツールのコードページを UTF-8 に統一する。
 )
 
 # ---------- 1. binutils ----------
+# mingwホスト: binutilsには --enable-win32-utf8-manifest 相当が無いので、
+# GCCソース同梱の winnt-utf8.manifest(GCC実行ファイルに入るものと同一)を
+# windresでRT_MANIFESTリソースにコンパイルし、LDFLAGS経由で全ホスト実行
+# ファイルのリンクに混ぜる。自前のRT_MANIFESTが存在するリンクでは、mingw
+# ターゲットのldは default-manifest.o を自動リンクしない(置き換え動作)。
+# 埋め込みの成否はスモークテスト(a0)で全数検証する。
+BINUTILS_LDFLAGS_ARG=()
+if [ -n "$HOST_TRIPLET" ]; then
+  MANIFEST_SRC="$SRC/gcc-${GCC_VERSION}/gcc/config/i386/winnt-utf8.manifest"
+  [ -f "$MANIFEST_SRC" ] || { echo "FAIL: $MANIFEST_SRC not found"; exit 1; }
+  MANIFEST_OBJ="$ROOT/build/utf8-manifest-$MODE.o"
+  mkdir -p "$ROOT/build"
+  cp "$MANIFEST_SRC" "$ROOT/build/utf8.manifest"
+  # 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
+  printf '1 24 "utf8.manifest"\n' > "$ROOT/build/utf8-manifest.rc"
+  ${HOST_TRIPLET}-windres -I "$ROOT/build" \
+    "$ROOT/build/utf8-manifest.rc" "$MANIFEST_OBJ"
+  BINUTILS_LDFLAGS_ARG=(LDFLAGS="$MANIFEST_OBJ")
+fi
+
 mkdir -p build/obj-binutils-$MODE && cd build/obj-binutils-$MODE
 "$SRC/binutils-${BINUTILS_VERSION}/configure" \
-  --prefix="$PREFIX" "${HOST_ARG[@]}" "${OPTS_BINUTILS[@]}"
+  --prefix="$PREFIX" "${HOST_ARG[@]}" "${OPTS_BINUTILS[@]}" \
+  "${BINUTILS_LDFLAGS_ARG[@]}"
 make -j"$NPROC"
 make install
 cd "$ROOT"
@@ -157,17 +183,26 @@ find "$PREFIX/bin" "$PREFIX/libexec" -type f \
 done
 
 # ---------- 5. smoke test ----------
-# (a0) mingwホスト: UTF-8マニフェストが混入していないこと（コードページ不整合の再発検知）
+# (a0) mingwホスト: ホットパスの全実行ファイルにUTF-8マニフェストが
+#      入っていること（コードページ混在=wazamono1問題系の再発検知）。
+#      gcc系はconfigure既定(PR108865)、binutils系は上の自前注入による。
 if [ -n "$HOST_TRIPLET" ]; then
-  for exe in "$PREFIX"/bin/avr-gcc.exe "$PREFIX"/libexec/gcc/avr/${GCC_VERSION}/cc1.exe \
-             "$PREFIX"/libexec/gcc/avr/${GCC_VERSION}/cc1plus.exe; do
-    [ -f "$exe" ] || continue
-    if grep -q activeCodePage "$exe"; then
-      echo "FAIL: UTF-8 manifest found in $(basename "$exe") (--disable-win32-utf8-manifest not effective)"
+  for exe in "$PREFIX"/bin/avr-gcc.exe \
+             "$PREFIX"/bin/avr-g++.exe \
+             "$PREFIX"/libexec/gcc/avr/${GCC_VERSION}/cc1.exe \
+             "$PREFIX"/libexec/gcc/avr/${GCC_VERSION}/cc1plus.exe \
+             "$PREFIX"/bin/avr-as.exe \
+             "$PREFIX"/bin/avr-ld.exe \
+             "$PREFIX"/bin/avr-objcopy.exe \
+             "$PREFIX"/bin/avr-size.exe \
+             "$PREFIX"/bin/avr-nm.exe; do
+    [ -f "$exe" ] || { echo "FAIL: $exe missing"; exit 1; }
+    if ! grep -q activeCodePage "$exe"; then
+      echo "FAIL: UTF-8 manifest missing in $(basename "$exe")"
       exit 1
     fi
   done
-  echo "OK: no UTF-8 manifest in host executables (uniform ANSI codepage)"
+  echo "OK: UTF-8 manifest present in all hot-path host executables"
 fi
 
 # (a) LTOリンカプラグインの存在（欠けると -fno-fat-lto-objects が使えない）
