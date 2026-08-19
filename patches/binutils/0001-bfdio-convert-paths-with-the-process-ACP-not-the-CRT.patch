@@ -1,0 +1,57 @@
+From: Yusuke Shimizu - Workshop Asahi <asahi.00@ws-asahi.net>
+Subject: [PATCH] bfdio: convert paths with the process ACP, not the CRT locale
+
+_bfd_real_fopen() on MinGW converts the incoming (multi-)byte path to
+a wide string with MultiByteToWideChar() before calling _wfopen(), and
+picks the conversion code page from the CRT locale via
+___lc_codepage_func().
+
+That source is wrong.  On Windows, the bytes that reach a program
+through its narrow argv are by construction encoded in the PROCESS
+ANSI code page: the OS converts the wide command line with the ACP,
+which is the system code page in the classic regime (e.g. 932 on
+Japanese Windows) and 65001 when the executable carries an embedded
+activeCodePage=UTF-8 manifest.  The CRT locale's code page, however,
+is resolved from the USER locale by setlocale(..., "") and stays 932
+on a Japanese system regardless of any manifest.
+
+The mismatch is invisible as long as both regimes agree (classic
+builds: argv bytes 932, locale cp 932 - works; ASCII-only paths: all
+code pages agree - works) but breaks exactly when a UTF-8 manifest is
+embedded and a path contains multibyte characters: UTF-8 bytes get
+decoded as Shift-JIS, GetFullPathNameW()/_wfopen() receive a mangled
+wide path, and every bfd-level open of such a path fails - observed as
+ld "cannot find <correct-looking path>" for startfiles and libraries
+under a Japanese-named prefix, while the (UTF-8-aware) GCC driver and
+compiler proper handle the very same paths fine.
+
+Use GetACP() instead: it reports the actual encoding of argv in both
+regimes, keeping classic ANSI builds byte-for-byte identical in
+behaviour and making UTF-8-manifest builds correct.
+
+--- a/bfd/bfdio.c
++++ b/bfd/bfdio.c
+@@ -122,11 +122,18 @@
+     }
+ 
+ #ifdef __MINGW32__
+-#if !HAVE_DECL____LC_CODEPAGE_FUNC
+-  /* This prototype was added to locale.h in version 9.0 of MinGW-w64.  */
+-  _CRTIMP unsigned int __cdecl ___lc_codepage_func (void);
+-#endif
+-  const unsigned int cp = ___lc_codepage_func ();
++  /* wazamono: use the process ANSI code page, not the CRT locale's.
++     Windows converts the wide command line to narrow argv bytes with
++     the process ACP (GetACP ()), so the ACP is by construction the
++     encoding of every path that reaches us through argv - both in the
++     classic regime (ACP = system code page, e.g. 932) and when an
++     embedded activeCodePage manifest makes the process run with
++     ACP = UTF-8 (65001).  ___lc_codepage_func () instead reports the
++     CRT locale's code page, which setlocale (..., "") resolves from
++     the USER locale (932 on Japanese Windows) regardless of the
++     manifest; under the UTF-8 regime that mis-decodes multibyte paths
++     here and every bfd-level open of such a path fails.  */
++  const unsigned int cp = GetACP ();
+ #else
+   const unsigned int cp = CP_UTF8;
+ #endif
