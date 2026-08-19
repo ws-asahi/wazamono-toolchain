@@ -124,6 +124,12 @@ OPTS_GCC=(
 # ファイルのリンクに混ぜる。自前のRT_MANIFESTが存在するリンクでは、mingw
 # ターゲットのldは default-manifest.o を自動リンクしない(置き換え動作)。
 # 埋め込みの成否はスモークテスト(a0)で全数検証する。
+# 注意: LDFLAGSへは必ず -Wl, 経由で渡すこと。生の .o を置くと、実行
+# ファイルのリンクには効く一方で、binutils同梱libtoolのライブラリ
+# (.la)リンクがそのオブジェクトを入力として扱い libsframe.la で
+# ビルドが壊れる(実測)。-Wl, 形式なら gcc がldへ入力として素通し
+# するため実行ファイルには埋め込まれ、libtoolの静的アーカイブ作成
+# ではリンカフラグとして無視される(両方向とも検証済み)。
 BINUTILS_LDFLAGS_ARG=()
 if [ -n "$HOST_TRIPLET" ]; then
   MANIFEST_SRC="$SRC/gcc-${GCC_VERSION}/gcc/config/i386/winnt-utf8.manifest"
@@ -135,7 +141,7 @@ if [ -n "$HOST_TRIPLET" ]; then
   printf '1 24 "utf8.manifest"\n' > "$ROOT/build/utf8-manifest.rc"
   ${HOST_TRIPLET}-windres -I "$ROOT/build" \
     "$ROOT/build/utf8-manifest.rc" "$MANIFEST_OBJ"
-  BINUTILS_LDFLAGS_ARG=(LDFLAGS="$MANIFEST_OBJ")
+  BINUTILS_LDFLAGS_ARG=(LDFLAGS="-Wl,$MANIFEST_OBJ")
 fi
 
 mkdir -p build/obj-binutils-$MODE && cd build/obj-binutils-$MODE
