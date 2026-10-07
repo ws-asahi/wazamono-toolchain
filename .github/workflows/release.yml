@@ -8,9 +8,10 @@
 #                        x86_64-apple-darwin,arm64-apple-darwin}.tar.gz
 #   checksums.txt / tools-fragment.json
 #
-# Phase 2で追加予定のジョブ（本ファイル末尾のコメント参照）:
-#   build-linux-arm (ubuntu-24.04-arm) / build-macos-intel (macos-13) /
-#   build-macos-arm (macos-latest)
+# macOS 版は release-macos.yml(手動実行・既存リリースへ追記のみ)で別途ビルド。
+# 本ワークフローを同一タグで再実行すると Linux/Windows 版のチェックサムが
+# 変わり配布済みインデックスと食い違うため、ホスト追加は追記型で行う。
+# Phase 2で追加予定: build-linux-arm (ubuntu-24.04-arm)
 name: release
 
 on:
@@ -105,10 +106,4 @@ jobs:
 #  build-avr-gcc-linux-arm:
 #    runs-on: ubuntu-24.04-arm
 #    steps: native ビルド → package aarch64-linux-gnu
-#  build-avr-gcc-macos-intel:
-#    runs-on: macos-13
-#    steps: native ビルド → package x86_64-apple-darwin
-#    （要 brew install texinfo gnu-tar 等。sha256sum→shasum差異にも注意）
-#  build-avr-gcc-macos-arm:
-#    runs-on: macos-latest
-#    steps: native ビルド → package arm64-apple-darwin
+#    (macOS と同様、既存リリースへの追記型ワークフローとして実装すること)

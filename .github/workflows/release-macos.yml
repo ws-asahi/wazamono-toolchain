@@ -1,0 +1,133 @@
+# wazamono-toolchain : macOS 版 avr-gcc の追加ビルド
+#
+# 目的:
+#   既存の tools-* リリース(Linux/Windows 版は公開済み・インデックスにチェック
+#   サムを転記済み)に、macOS 版 avr-gcc だけを後から追加する。release.yml を
+#   同じタグで再実行すると Linux/Windows 版のアーカイブが再生成されてチェック
+#   サムが変わり、配布済みインデックスと食い違ってインストール不能になるため、
+#   macOS は独立したワークフローで既存リリースへ「追記のみ」行う。
+#
+# トリガ: 手動実行(workflow_dispatch)。release_tag に追加先の既存タグを指定。
+# 生成物:
+#   avr-gcc-<ver>-<rev>-x86_64-apple-darwin.tar.gz   (macos-15-intel でネイティブビルド)
+#   avr-gcc-<ver>-<rev>-arm64-apple-darwin.tar.gz    (macos-15 でネイティブビルド)
+#   checksums-darwin.txt / tools-fragment-darwin.json
+#   → tools-fragment-darwin.json の systems をインデックスの avr-gcc.systems に追記する
+#
+# 安全策:
+#   - versions.env が導く tools-<GCC_VERSION>-<PKG_REV> と release_tag の一致を検証
+#     (main の versions.env を進めた後に古いタグへ誤って追加するのを防ぐ)
+#   - 既存アセットは上書きしない(tar.gz は衝突時に失敗させる)
+#   - avrdude は再パッケージしない(既存の macOS 版 avrdude をそのまま使う)
+name: release-macos
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "追加先の既存リリースタグ (例: tools-15.2.0-wazamono2)"
+        required: true
+        type: string
+      upload:
+        description: "既存リリースへアセットをアップロードする (false ならビルド+Artifacts のみ)"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build-avr-gcc-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            host: x86_64-apple-darwin
+          - runner: macos-15
+            host: arm64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 320
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify versions.env matches the target release tag
+        run: |
+          source versions.env
+          expected="tools-${GCC_VERSION}-${PKG_REV}"
+          if [ "$expected" != "${{ inputs.release_tag }}" ]; then
+            echo "versions.env yields '$expected' but release_tag is '${{ inputs.release_tag }}'"
+            echo "(check out the matching revision or fix the input)"
+            exit 1
+          fi
+
+      - name: Verify runner architecture matches host string
+        run: |
+          case "${{ matrix.host }}" in
+            x86_64-apple-darwin) want=x86_64 ;;
+            arm64-apple-darwin)  want=arm64  ;;
+            *) echo "unknown host ${{ matrix.host }}"; exit 1 ;;
+          esac
+          [ "$(uname -m)" = "$want" ] || { echo "runner is $(uname -m), expected $want"; exit 1; }
+          sw_vers; xcodebuild -version | head -1
+
+      - name: Install build dependencies
+        # texinfo は keg-only なので PATH に明示追加。flex/bison は Xcode CLT 同梱の
+        # もので足りる。gmp/mpfr/mpc/isl は GCC ソースツリー内で静的ビルドされる
+        # ため Homebrew からは入れない(入れると binutils/gcc が拾う恐れがある)。
+        run: |
+          brew install texinfo
+          echo "$(brew --prefix texinfo)/bin" >> "$GITHUB_PATH"
+
+      - name: Build native (${{ matrix.host }})
+        run: bash scripts/build-avr-gcc.sh native
+
+      - name: Package
+        run: bash scripts/package-avr-gcc.sh build/prefix-native ${{ matrix.host }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avr-gcc-${{ matrix.host }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build-avr-gcc-macos
+    if: ${{ inputs.upload }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums and index fragment (darwin only)
+        run: |
+          cd dist && sha256sum *.tar.gz > checksums-darwin.txt && cd ..
+          python3 scripts/gen-index-fragment.py \
+            --url-base "https://github.com/${{ github.repository }}/releases/download/${{ inputs.release_tag }}" \
+            > dist/tools-fragment-darwin.json
+          cat dist/checksums-darwin.txt
+          cat dist/tools-fragment-darwin.json
+
+      - name: Upload to the existing release (append only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release view "$TAG" --repo "${{ github.repository }}" --json tagName >/dev/null \
+            || { echo "release '$TAG' not found"; exit 1; }
+          existing=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq '.assets[].name')
+          for f in dist/*.tar.gz; do
+            if printf '%s\n' "$existing" | grep -qx "$(basename "$f")"; then
+              echo "FAIL: asset already exists on $TAG: $(basename "$f") (delete it manually to replace)"
+              exit 1
+            fi
+          done
+          # tar.gz は衝突時に失敗(上の検査で既に排除)。付随ファイルは再実行を許す。
+          gh release upload "$TAG" --repo "${{ github.repository }}" dist/*.tar.gz
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber \
+            dist/checksums-darwin.txt dist/tools-fragment-darwin.json
+          echo "Uploaded to https://github.com/${{ github.repository }}/releases/tag/$TAG"
