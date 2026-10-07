@@ -6,6 +6,10 @@
 #   scripts/build-avr-gcc.sh mingw-x64       # Linux上でWindows x64向けカナディアンクロス
 #                                            # (事前に native が同一マシンで完了していること)
 #
+# native は Linux と macOS (Intel / Apple Silicon) の両方で動く。macOS 固有の
+# 配慮(Bash 3.2、libzstd 非依存、デプロイメントターゲット、strip/署名)は
+# 下の IS_DARWIN 分岐に集約してあり、Linux/mingw の生成物には影響しない。
+#
 # configureフラグは ZakKemble/avr-gcc-build の既知動作構成に準拠。
 # 特に --enable-plugin は必須（欠けると liblto_plugin が生成されず、
 # -fno-fat-lto-objects が使えない = Arduinoコアのビルドが通らない）。
@@ -19,6 +23,31 @@ ROOT=$PWD
 DL=$ROOT/build/dl
 SRC=$ROOT/build/src
 NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+# ---------- host OS detection ----------
+IS_DARWIN=0
+[ "$(uname -s)" = Darwin ] && IS_DARWIN=1
+
+if [ "$IS_DARWIN" = 1 ]; then
+  # 配布バイナリが「ビルドしたランナーの macOS 以上」でしか起動しなくなるのを
+  # 防ぐ。clang は環境変数 MACOSX_DEPLOYMENT_TARGET を全コンパイル/リンクで
+  # 尊重する。x86_64 は Rosetta 2 でも使われるので下限を広めに取る。
+  case "$(uname -m)" in
+    arm64)  : "${MACOSX_DEPLOYMENT_TARGET:=11.0}" ;;
+    *)      : "${MACOSX_DEPLOYMENT_TARGET:=10.15}" ;;
+  esac
+  export MACOSX_DEPLOYMENT_TARGET
+  echo ">> Darwin host ($(uname -m)), MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+fi
+
+# sha256 検証: Linux は sha256sum、macOS 標準環境は shasum しか無い
+sha256_check() { # sha256_check <SHA256> <file>
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "$1  $2" | sha256sum -c - >/dev/null
+  else
+    echo "$1  $2" | shasum -a 256 -c - >/dev/null
+  fi
+}
 
 case $MODE in
   native)
@@ -41,7 +70,7 @@ fetch() { # fetch <URL> <SHA256>
   local url=$1 sum=$2 f=$DL/$(basename "$1")
   [ -f "$f" ] || curl -fL --retry 3 -o "$f" "$url"
   if [ -n "$sum" ]; then
-    echo "$sum  $f" | sha256sum -c - || { echo "CHECKSUM MISMATCH: $url"; exit 1; }
+    sha256_check "$sum" "$f" || { echo "CHECKSUM MISMATCH: $url"; exit 1; }
   else
     echo "WARNING: no pinned checksum for $url (run scripts/update-pins.sh)"
   fi
@@ -89,6 +118,11 @@ OPTS_BINUTILS=(
   --disable-nls
   --disable-werror
 )
+# macOS: binutils は pkg-config 経由で Homebrew の libzstd を自動検出し、
+# avr-as/avr-ld が /opt/homebrew (or /usr/local) の libzstd.1.dylib に動的
+# 依存してしまう。Homebrew の無い Mac で起動不能になるので明示的に切る。
+# (gcc 側は元々 --without-zstd 指定済み)
+[ "$IS_DARWIN" = 1 ] && OPTS_BINUTILS+=(--without-zstd)
 
 OPTS_GCC=(
   --target=avr
@@ -144,10 +178,13 @@ if [ -n "$HOST_TRIPLET" ]; then
   BINUTILS_LDFLAGS_ARG=(LDFLAGS="-Wl,$MANIFEST_OBJ")
 fi
 
+# 注意: HOST_ARG / BINUTILS_LDFLAGS_ARG は native では空配列。macOS 標準の
+# Bash 3.2 では set -u 下で空配列を "${a[@]}" 展開すると unbound variable に
+# なるため、"${a[@]+"${a[@]}"}" 形式で展開する(Bash 4+ でも同じ結果)。
 mkdir -p build/obj-binutils-$MODE && cd build/obj-binutils-$MODE
 "$SRC/binutils-${BINUTILS_VERSION}/configure" \
-  --prefix="$PREFIX" "${HOST_ARG[@]}" "${OPTS_BINUTILS[@]}" \
-  "${BINUTILS_LDFLAGS_ARG[@]}"
+  --prefix="$PREFIX" "${HOST_ARG[@]+"${HOST_ARG[@]}"}" "${OPTS_BINUTILS[@]}" \
+  "${BINUTILS_LDFLAGS_ARG[@]+"${BINUTILS_LDFLAGS_ARG[@]}"}"
 make -j"$NPROC"
 make install
 cd "$ROOT"
@@ -158,7 +195,7 @@ cd "$ROOT"
 # ---------- 2. gcc (c, c++) ----------
 mkdir -p build/obj-gcc-$MODE && cd build/obj-gcc-$MODE
 "$SRC/gcc-${GCC_VERSION}/configure" \
-  --prefix="$PREFIX" "${HOST_ARG[@]}" "${OPTS_GCC[@]}"
+  --prefix="$PREFIX" "${HOST_ARG[@]+"${HOST_ARG[@]}"}" "${OPTS_GCC[@]}"
 make -j"$NPROC"
 make install
 cd "$ROOT"
@@ -181,11 +218,27 @@ else
 fi
 
 # ---------- 4. strip host binaries ----------
-STRIP=strip
-[ -n "$HOST_TRIPLET" ] && STRIP=${HOST_TRIPLET}-strip
+STRIP=(strip)
+[ -n "$HOST_TRIPLET" ] && STRIP=("${HOST_TRIPLET}-strip")
+if [ "$IS_DARWIN" = 1 ]; then
+  # macOS の strip は引数なしだと全シンボル削除を試み、liblto_plugin 等の
+  # 動的ライブラリでは失敗する(|| true で握り潰されて未 strip のまま残る)。
+  # -x (ローカルシンボルのみ削除) なら実行ファイル/ライブラリ両方に安全。
+  STRIP=(strip -x)
+fi
 find "$PREFIX/bin" "$PREFIX/libexec" -type f \
   \( -perm -u+x -o -name '*.exe' -o -name '*.dll' \) 2>/dev/null | while read -r f; do
-  "$STRIP" "$f" 2>/dev/null || true
+  "${STRIP[@]}" "$f" 2>/dev/null || true
+  if [ "$IS_DARWIN" = 1 ]; then
+    # Apple Silicon では未署名の Mach-O は起動を拒否される(SIGKILL)。strip で
+    # リンカ付与の ad-hoc 署名が無効化され得るため、Mach-O だけ再署名する。
+    # ad-hoc 署名(-s -)は配布先マシンを問わず有効で、証明書も不要。
+    # シェルスクリプト等の非 Mach-O は file(1) で除外する。
+    if file -b "$f" | grep -q 'Mach-O'; then
+      codesign --force --sign - "$f" 2>/dev/null \
+        || { echo "FAIL: codesign failed for $f"; exit 1; }
+    fi
+  fi
 done
 
 # ---------- 5. smoke test ----------
@@ -238,6 +291,27 @@ if [ -z "$HOST_TRIPLET" ]; then
   done
   rm -rf "$T"
   "$PREFIX/bin/avr-gcc" --version | head -1
+fi
+
+# (d) macOS: 配布可搬性の全数検証
+#     - Homebrew / MacPorts のライブラリに動的依存していないこと
+#       (ランナーにだけ存在する dylib に依存すると、一般ユーザーの Mac で
+#       dyld がロードに失敗する = wazamono2 Linux/Windows 版では起きない事故)
+#     - 全 Mach-O の署名が有効であること(strip 後の再署名漏れ検知)
+#     - 最小 macOS バージョンが MACOSX_DEPLOYMENT_TARGET に一致すること
+if [ "$IS_DARWIN" = 1 ]; then
+  find "$PREFIX/bin" "$PREFIX/libexec" -type f -perm -u+x | while read -r f; do
+    file -b "$f" | grep -q 'Mach-O' || continue
+    if otool -L "$f" | grep -qE '/(opt/homebrew|usr/local|opt/local)/'; then
+      echo "FAIL: $f depends on a non-system library:"; otool -L "$f"; exit 1
+    fi
+    codesign --verify "$f" 2>/dev/null \
+      || { echo "FAIL: invalid code signature: $f"; exit 1; }
+  done
+  minos=$(otool -l "$PREFIX/bin/avr-gcc" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+  [ "$minos" = "$MACOSX_DEPLOYMENT_TARGET" ] \
+    || { echo "FAIL: avr-gcc minos=$minos, expected $MACOSX_DEPLOYMENT_TARGET"; exit 1; }
+  echo "OK: Darwin portability (no Homebrew deps, signed, minos=$minos)"
 fi
 
 echo "DONE: $MODE -> $PREFIX"
