@@ -150,6 +150,13 @@ OPTS_GCC=(
   # オプションが無いため、下のbinutilsステップでリソースを自前注入して
   # 全ツールのコードページを UTF-8 に統一する。
 )
+# macOS: GCC ソース同梱の zlib(1.1.4 相当の古い版)は zutil.h が macOS 向けに
+# fdopen を NULL へ置き換えるマクロを定義しており、Xcode 16 SDK の stdio.h
+# にある fdopen 宣言と衝突してコンパイル不能(実測: libz_a-zutil.o で
+# "expected identifier or '('")。macOS 標準の /usr/lib/libz.1.dylib を使う
+# (Homebrew の avr-gcc も同じ指定)。システムライブラリなので可搬性チェック
+# (d) の対象外であり、どの Mac にも存在する。
+[ "$IS_DARWIN" = 1 ] && OPTS_GCC+=(--with-system-zlib)
 
 # ---------- 1. binutils ----------
 # mingwホスト: binutilsには --enable-win32-utf8-manifest 相当が無いので、
